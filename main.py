@@ -1,59 +1,53 @@
-# main.py
 from fastapi import FastAPI
 from pydantic import BaseModel
-import random
+import faiss, pickle, numpy as np
+from sentence_transformers import SentenceTransformer
+import openai, os
 
-# Create FastAPI app instance
+# Load API key from Render environment variables
+openai.api_key = os.getenv("OPENAI_API_KEY")
+
+# Load FAISS index & clauses
+index = faiss.read_index("vector_index.faiss")
+with open("clauses.pkl", "rb") as f:
+    clauses = pickle.load(f)
+
+embed_model = SentenceTransformer('all-MiniLM-L6-v2')
+
 app = FastAPI(
-    title="FinSight.AI HackRx Webhook",
-    description="Own LLM Insurance Decision Assistant (Survival Mode)",
-    version="1.0.0"
+    title="HackRx Webhook LLM",
+    description="LLM-powered clause retrieval + decision-making for insurance queries",
+    version="1.0"
 )
 
-# Request body model
 class QueryRequest(BaseModel):
     query: str
 
-# Preloaded clause snippets (from your PDFs)
-CLAUSES = {
-    "knee surgery": "Clause 5.3: Surgical procedures covered only after 6 months waiting period.",
-    "maternity": "Clause 3.2: Maternity not covered within the first 90 days from policy inception.",
-    "dialysis": "Clause 4.1: Dialysis covered after 30-day initial waiting period.",
-    "fracture": "Clause 6.2: Accidental fractures covered from day one under accidental benefit."
-}
-
-# Main webhook endpoint
 @app.post("/api/v1/hackrx/run")
 async def hackrx_webhook(req: QueryRequest):
-    query = req.query.lower()
+    query = req.query
 
-    decision = "Unknown"
-    justification = "Query not recognized. Please upload valid documents."
-    amount = None
+    # Step 1: Find most relevant clause
+    q_emb = embed_model.encode([query], convert_to_numpy=True)
+    distances, ids = index.search(np.array(q_emb), k=1)
+    best_clause = clauses[ids[0][0]]
 
-    # Simple rule-based logic
-    if "knee surgery" in query and "3-month" in query:
-        decision = "Rejected"
-        justification = CLAUSES["knee surgery"]
-    elif "maternity" in query or "c-section" in query:
-        decision = "Rejected"
-        justification = CLAUSES["maternity"]
-    elif "dialysis" in query:
-        decision = "Approved"
-        justification = CLAUSES["dialysis"]
-        amount = random.randint(50000, 200000)
-    elif "fracture" in query:
-        decision = "Approved"
-        justification = CLAUSES["fracture"]
-        amount = random.randint(20000, 100000)
+    # Step 2: Ask OpenAI to decide
+    prompt = f"""
+    You are an insurance claim decision assistant.
+    Query: {query}
+    Relevant policy clause: {best_clause}
+    Based on this, respond ONLY in valid JSON with:
+    - decision: "Approved" or "Rejected"
+    - amount: null or a number
+    - justification: Explain briefly, referencing the clause
+    """
 
-    return {
-        "decision": decision,
-        "amount": amount,
-        "justification": justification
-    }
+    completion = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0
+    )
 
-# Run locally
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8001, reload=True)
+    decision_json = completion.choices[0].message["content"]
+    return {"result": decision_json}
